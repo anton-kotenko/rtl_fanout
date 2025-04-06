@@ -9,9 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
-	"sync"
-
-	"golang.org/x/exp/slices"
+	"strings"
 
 	"go.uber.org/zap"
 )
@@ -19,15 +17,28 @@ import (
 type cmdParams struct {
 	listenAddr netip.AddrPort
 	destAddr   netip.AddrPort
+	outFiles   []string
+}
+
+type filesList []string
+
+func (fl *filesList) String() string {
+	return strings.Join(*fl, ",")
+}
+func (fl *filesList) Set(value string) error {
+	*fl = append(*fl, value)
+	return nil
 }
 
 func parseCMDParams(args []string) (cmdParams, error) {
 	dest := ""
 	listen := ""
+	outFiles := filesList{}
 
 	fs := flag.NewFlagSet("rtl_fanout", flag.ExitOnError)
 	fs.StringVar(&dest, "d", "", "destination ip:port, 1.2.3.4:123")
 	fs.StringVar(&listen, "l", "", "listen on ip:port, 0.0.0.0:123")
+	fs.Var(&outFiles, "f", "/path/to/file")
 
 	decorateError := func(err error) error {
 		if err == nil {
@@ -58,79 +69,11 @@ func parseCMDParams(args []string) (cmdParams, error) {
 	return cmdParams{
 		listenAddr: listenAddr,
 		destAddr:   destAddr,
+		outFiles:   outFiles,
 	}, nil
 }
 
 type dongleInfo []byte
-
-type sink struct {
-	conn    *net.TCPConn
-	logger  *zap.Logger
-	buffers chan []byte
-}
-
-func newSink(logger *zap.Logger, conn *net.TCPConn) (*sink, error) {
-	const bufSize = 10000
-	remoteAddr := conn.RemoteAddr()
-	s := sink{
-		logger:  logger.With(zap.String("remote_addr", remoteAddr.String())),
-		conn:    conn,
-		buffers: make(chan []byte, bufSize),
-	}
-	return &s, nil
-}
-
-func (s *sink) run(ctx context.Context) error {
-	s.logger.Info("starting sink")
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go func() {
-		<-ctx.Done()
-		s.conn.Close()
-	}()
-	defer s.conn.Close() // FIXME might already be closed
-
-	wg := sync.WaitGroup{}
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		const bufSize = 100
-		buf := make([]byte, bufSize)
-		for {
-			_, err := s.conn.Read(buf)
-			if err != nil {
-				s.logger.Warn("client read failed, likely socket close", zap.Error(err))
-				break
-			}
-			s.logger.Warn("unexpected chunk from client, ignore")
-		}
-	}()
-	go func() {
-		wg.Done()
-		for {
-			chunk := <-s.buffers
-			_, err := s.conn.Write(chunk)
-			if err != nil {
-				s.logger.Error("failed to write bytes", zap.Error(err))
-				break
-			}
-		}
-	}()
-
-	wg.Wait()
-	err := s.conn.Close()
-	s.logger.Info("closing sync", zap.Error(err))
-	return err
-}
-
-func (s *sink) send(chunk []byte) {
-	// FIXME if already closed -- ignore chunk
-	select {
-	case s.buffers <- chunk:
-	default:
-		s.logger.Warn("sink overflow")
-	}
-}
 
 type fanoutProxy struct {
 	dongleInfo []byte
@@ -160,8 +103,26 @@ func (p *fanoutProxy) Run(ctx context.Context) error {
 	}
 	p.logger.Info("connected to source", zap.String("address", listenTcpAddr.String()))
 
+	fanoutSink := newFanoutSink()
+
+	for _, filePath := range p.params.outFiles {
+		go func() {
+			for {
+				sink, err := newFileSink(p.logger, filePath)
+				if err != nil {
+					p.logger.Error("failed to open file", zap.String("dest file path", filePath), zap.Error(err))
+					continue
+				}
+				fanoutSink.AddSink(sink)
+				_ = sink.Run(ctx)
+				fanoutSink.RemoveSink(sink)
+			}
+		}()
+	}
+
 	go func() {
 		<-ctx.Done()
+		p.logger.Info("context cancel")
 		listener.Close()
 		destConn.Close()
 	}()
@@ -173,9 +134,6 @@ func (p *fanoutProxy) Run(ctx context.Context) error {
 	p.dongleInfo = dongleInfo
 	p.logger.Info("got dongle info", zap.String("address", listenTcpAddr.String()))
 
-	var mu sync.RWMutex
-	destinations := []*sink{}
-
 	go func() {
 		for {
 			conn, err := listener.AcceptTCP()
@@ -183,22 +141,16 @@ func (p *fanoutProxy) Run(ctx context.Context) error {
 				p.logger.Error("accept call failed", zap.Error(err))
 				continue
 			}
-			s, err := newSink(p.logger, conn)
+			s, err := newTcpSocketSink(p.logger, conn)
 			if err != nil {
 				p.logger.Error("faild to create a sync", zap.Error(err))
 				continue
 			}
 			go func() {
-				s.send(p.dongleInfo)
-				mu.Lock()
-				destinations = append(destinations, s)
-				mu.Unlock()
-				_ = s.run(ctx)
-				mu.Lock()
-				defer mu.Unlock()
-				destinations = slices.DeleteFunc(destinations, func(elem *sink) bool {
-					return elem == s
-				})
+				s.Send(p.dongleInfo)
+				fanoutSink.AddSink(s)
+				_ = s.Run(ctx)
+				fanoutSink.RemoveSink(s)
 			}()
 		}
 	}()
@@ -212,49 +164,8 @@ func (p *fanoutProxy) Run(ctx context.Context) error {
 			destConn.Close()
 			return nil
 		}
-
-		mu.RLock()
-		dests := make([]*sink, len(destinations))
-		copy(dests, destinations)
-		mu.RUnlock()
-		for _, dest := range dests {
-			dest.send(buf)
-		}
+		fanoutSink.Send(buf)
 	}
-}
-
-func (p *fanoutProxy) handleInboundConnection(ctx context.Context, conn *net.TCPConn, data chan []byte) {
-	go func() {
-		<-ctx.Done()
-		// FIXME double close?
-		conn.Close()
-	}()
-	go func() {
-		const bufSize = 100
-		buf := make([]byte, bufSize)
-		for {
-			_, err := conn.Read(buf)
-			if err != nil {
-				fmt.Println("failed to read from connection: %w", err)
-				conn.Close()
-				return
-			} else {
-				fmt.Println("unexpected chunk of data, ignore!")
-			}
-		}
-	}()
-	go func() {
-		for {
-			chunk, ok := <-data
-			if !ok {
-				conn.Close()
-			}
-			_, err := conn.Write(chunk)
-			if err != nil {
-				fmt.Println("failed to write bytes", err)
-			}
-		}
-	}()
 }
 
 func (p *fanoutProxy) readDongleInfo(conn *net.TCPConn) (dongleInfo, error) {
