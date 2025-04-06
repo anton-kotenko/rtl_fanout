@@ -1,0 +1,22 @@
+# sudo cp rtl_tcp.service /etc/systemd/system/
+# sudo systemctl  daemon-reload
+# systemctl enable rtl_tcp
+# systemctl start rtl_tcp
+[Unit]
+Description=rtl-sdr fanout proxy
+After=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+LimitCORE=infinity
+
+ExecStart=/usr/local/bin/rtl_tcp -a 127.0.0.1 -p 1234 -f 1090000000 -s 2400000 -g260
+PermissionsStartOnly=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
+

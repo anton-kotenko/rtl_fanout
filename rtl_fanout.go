@@ -1,5 +1,10 @@
 package main
 
+/*
+build on raspberry pi
+GOHOSTARCH=arm GOARCH=arm go build *.go
+*/
+
 import (
 	"bytes"
 	"context"

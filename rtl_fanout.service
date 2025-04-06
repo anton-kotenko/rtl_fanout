@@ -1,0 +1,26 @@
+# sudo cp rtl_fanout /usr/bin/rtl_fanout
+# sudo cp rtl_fanout.service /etc/systemd/system/
+# sudo systemctl  daemon-reload
+# sudo systemctl enable rtl_fanout
+# sudo systemctl start rtl_fanout
+[Unit]
+Description=rtl-sdr fanout proxy
+After=network-online.target
+After=rtl_tcp.service
+Requires=rtl_tcp.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=20
+LimitCORE=infinity
+ExecStartPre=bash -c "test -p /var/run/rtl.fifo || (rm -f /var/run/rtl.fifo && mkfifo /var/run/rtl.fifo && chmod 777 /var/run/rtl.fifo)"
+ExecStart=/usr/bin/rtl_fanout -l="0.0.0.0:1235" -d="127.0.0.1:1234" -f /var/run/rtl.fifo
+PermissionsStartOnly=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
+
