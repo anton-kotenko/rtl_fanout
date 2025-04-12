@@ -162,14 +162,14 @@ func (p *fanoutProxy) Run(ctx context.Context) error {
 	for {
 		const bufSize = 1000
 		buf := make([]byte, bufSize)
-		_, err := destConn.Read(buf)
+		read, err := destConn.Read(buf)
 		if err != nil {
 			fmt.Println("failed to read from connection: %w", err)
 			// FIXME  exit?
 			destConn.Close()
 			return nil
 		}
-		fanoutSink.Send(buf)
+		fanoutSink.Send(buf[:read])
 	}
 }
 
