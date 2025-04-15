@@ -6,8 +6,8 @@
 [Unit]
 Description=rtl-sdr fanout proxy
 After=network-online.target
-After=rtl_tcp.service
-Requires=rtl_tcp.service
+#After=rtl_tcp.service
+#Requires=rtl_tcp.service
 
 [Service]
 Type=simple
